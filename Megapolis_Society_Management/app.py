@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, send_file, flash, redirect, url_for
+from flask import Flask, request, render_template_string, send_file, flash, redirect, url_for, session, abort
 from openpyxl import load_workbook
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
@@ -9,10 +9,69 @@ from docx.oxml.ns import qn
 from werkzeug.utils import secure_filename
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-import os, io, re
+import os, io, re, sqlite3, secrets, time, zipfile, xml.etree.ElementTree as ET
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = "local-defaulter-report"
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 8,
+)
+DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "society_users.db"))
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_auth_db():
+    with db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin','staff')),
+            created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+
+def log_activity(username, action):
+    with db() as conn:
+        conn.execute("INSERT INTO activity_log(username,action,created_at) VALUES(?,?,?)",
+                     (username, action, datetime.utcnow().isoformat(timespec="seconds")))
+
+def user_count():
+    with db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("user_id"):
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+    return wrapped
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("user_id"):
+            return redirect(url_for("login", next=request.path))
+        if session.get("role") != "admin":
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+init_auth_db()
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB per request
 ALLOWED_EXCEL = {".xlsx", ".xlsm"}
 ALLOWED_WORD = {".docx"}
@@ -232,12 +291,12 @@ a{transition:.15s}
 </div>
 <div class="layout">
 <section class="panel">
-<h2 class="section-title">Create a new report</h2><p class="section-sub">Upload both files, confirm the selected names and generate your Word document.</p>
+<h2 class="section-title">Create a new report</h2><p class="section-sub">Upload both files, confirm the selected names and download your ZIP report.</p>
 {% with messages = get_flashed_messages() %}{% if messages %}{% for m in messages %}<div class="alert">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
 <form id="reportForm" method="post" action="/generate" enctype="multipart/form-data">
 <div class="upload"><div class="stepno">01</div><div class="field"><label for="excel">Defaulter Excel File</label><p>Choose the latest member outstanding list (.xlsx / .xlsm).</p><input id="excel" type="file" name="excel" accept=".xlsx,.xlsm" required><div class="filename" id="excelName">No Excel file selected</div></div></div>
 <div class="upload"><div class="stepno">02</div><div class="field"><label for="template">Society Word Template</label><p>Choose the approved Society template (.docx).</p><input id="template" type="file" name="template" accept=".docx" required><div class="filename" id="wordName">No Word template selected</div></div></div>
-<button id="submitBtn" type="submit">Generate &amp; Download Word Report&nbsp; →</button>
+<button id="submitBtn" type="submit">Generate &amp; Download ZIP Report&nbsp; →</button>
 <div class="privacy"><span>🔒</span><div><b>Your files stay on this computer.</b> This local tool processes the selected Excel and Word files on your PC; it does not upload them to a public website.</div></div>
 </form>
 <form method="post" action="/analyze" enctype="multipart/form-data" style="border-top:1px solid #e8edf4;margin-top:17px;padding-top:15px">
@@ -308,8 +367,84 @@ def set_repeat_table_header(row):
     tblHeader.set(qn("w:val"), "true")
     trPr.append(tblHeader)
 
+def repair_excel_styles(file_stream):
+    """Repair common malformed XLSX/XLSM style records before openpyxl reads them.
+
+    Some Excel exports contain empty <fill/> entries. openpyxl expects each
+    fill entry to deserialize into a Fill object and otherwise raises errors
+    such as: expected <class 'openpyxl.styles.fills.Fill'>.
+    This function repairs those style records in memory without changing the
+    uploaded original file or its worksheet data.
+    """
+    file_stream.seek(0)
+    raw = file_stream.read()
+    file_stream.seek(0)
+    try:
+        source = io.BytesIO(raw)
+        output_files = []
+        changed = False
+        with zipfile.ZipFile(source, 'r') as zin:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == 'xl/styles.xml':
+                    root = ET.fromstring(data)
+                    ns_uri = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+                    ns = {'m': ns_uri}
+                    fills = root.find('m:fills', ns)
+                    if fills is not None:
+                        for fill in list(fills):
+                            pattern = fill.find('m:patternFill', ns)
+                            gradient = fill.find('m:gradientFill', ns)
+                            if pattern is None and gradient is None:
+                                ET.SubElement(fill, '{%s}patternFill' % ns_uri,
+                                              {'patternType': 'none'})
+                                changed = True
+                        fills.set('count', str(len(list(fills))))
+
+                    # Guard against style records pointing to non-existent fills.
+                    if fills is not None:
+                        fill_count = len(list(fills))
+                        for xf_group_name in ('cellXfs', 'cellStyleXfs'):
+                            group = root.find('m:' + xf_group_name, ns)
+                            if group is None:
+                                continue
+                            for xf in list(group):
+                                fill_id = xf.get('fillId')
+                                if fill_id is not None:
+                                    try:
+                                        invalid = int(fill_id) >= fill_count or int(fill_id) < 0
+                                    except ValueError:
+                                        invalid = True
+                                    if invalid:
+                                        xf.set('fillId', '0')
+                                        changed = True
+                    if changed:
+                        ET.register_namespace('', ns_uri)
+                        ET.register_namespace('mc', 'http://schemas.openxmlformats.org/markup-compatibility/2006')
+                        ET.register_namespace('x14ac', 'http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac')
+                        data = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+                output_files.append((info, data))
+
+        if not changed:
+            return io.BytesIO(raw)
+        repaired = io.BytesIO()
+        with zipfile.ZipFile(repaired, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for info, data in output_files:
+                zout.writestr(info, data)
+        repaired.seek(0)
+        return repaired
+    except zipfile.BadZipFile:
+        raise ValueError('ही फाइल वैध .xlsx/.xlsm Excel फाइल नाही किंवा ZIP structure खराब आहे. Excel मध्ये उघडून Save As करा.')
+    except ET.ParseError:
+        raise ValueError('Excel मधील Styles XML वाचता आले नाही. कृपया Excel मध्ये फाइल उघडून नवीन .xlsx म्हणून Save करा.')
+
+
 def read_rows(file_stream):
-    wb = load_workbook(file_stream, data_only=True)
+    safe_stream = repair_excel_styles(file_stream)
+    try:
+        wb = load_workbook(safe_stream, data_only=True)
+    except Exception as exc:
+        raise ValueError('Excel फाइल वाचता आली नाही. फाइल password-protected, unsupported किंवा गंभीरपणे corrupt असू शकते. तपशील: ' + str(exc))
     ws = wb.active
     headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
     required = ["Block", "Unit #", "Overdue Days", "Pending Amount"]
@@ -457,6 +592,137 @@ def generate_docx(excel_file, template_file):
     output.seek(0)
     return output, len(grouped), sum(len(v) for v in grouped.values()), all_total
 
+
+AUTH_STYLE = """
+<style>
+body{margin:0;background:radial-gradient(circle at 10% 5%,#dbeafe,transparent 30%),#f2f6fc;font-family:Segoe UI,Arial;color:#1e293b}
+.authwrap{max-width:440px;margin:7vh auto;padding:18px}.authcard{background:#fff;border:1px solid #dce6f2;border-radius:20px;padding:28px;box-shadow:0 18px 45px #12385d18}
+.brand{color:#173b64;font-size:13px;font-weight:800;letter-spacing:1px}.authcard h1{font-size:24px;color:#132f50;margin:20px 0 6px}
+.sub{color:#64748b;font-size:12px;line-height:1.6;margin-bottom:22px}
+label{display:block;font-size:12px;font-weight:700;margin:13px 0 6px}
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd8e8;border-radius:9px;font-size:14px}
+button{width:100%;margin-top:20px;border:0;border-radius:9px;padding:13px;background:linear-gradient(110deg,#2458c5,#397de0);color:white;font-weight:800;cursor:pointer}
+.alert{background:#fff4e5;border:1px solid #f2d3a1;color:#80551b;border-radius:8px;padding:10px;font-size:12px;margin:10px 0}
+small{color:#64748b;font-size:11px}
+</style>
+"""
+LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Society Login</title>""" + AUTH_STYLE + """</head><body><div class="authwrap"><div class="authcard">
+<div class="brand">MEGAPOLIS SUNWAY · SOCIETY PORTAL</div><h1>Welcome back</h1><div class="sub">Sign in with your authorised Society account.</div>
+{% with messages=get_flashed_messages() %}{% for m in messages %}<div class="alert">{{m}}</div>{% endfor %}{% endwith %}
+<form method="post"><label>Username</label><input name="username" autocomplete="username" required autofocus>
+<label>Password</label><input type="password" name="password" autocomplete="current-password" required>
+<button type="submit">Secure Login</button></form><p><small>Access is restricted to authorised Society staff.</small></p></div></div></body></html>"""
+SETUP_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Initial Admin Setup</title>""" + AUTH_STYLE + """</head><body><div class="authwrap"><div class="authcard">
+<div class="brand">MEGAPOLIS SUNWAY · FIRST-TIME SETUP</div><h1>Create Administrator</h1><div class="sub">Create the first Admin account. Use a unique password of at least 12 characters. This setup page disables itself after the first Admin is created.</div>
+{% with messages=get_flashed_messages() %}{% for m in messages %}<div class="alert">{{m}}</div>{% endfor %}{% endwith %}
+<form method="post"><label>Admin Username</label><input name="username" minlength="4" maxlength="40" required>
+<label>Admin Password</label><input type="password" name="password" minlength="12" required>
+<label>Confirm Password</label><input type="password" name="confirm" minlength="12" required>
+<button type="submit">Create Admin Account</button></form></div></div></body></html>"""
+ADMIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Admin Control</title>""" + AUTH_STYLE + """</head><body><div class="authwrap" style="max-width:650px"><div class="authcard">
+<div class="brand">MEGAPOLIS SUNWAY · ADMIN CONTROL</div><h1>Staff Access Management</h1><div class="sub">You selected one shared Staff login. Admin can create or reset the shared Staff username and password here.</div>
+{% with messages=get_flashed_messages() %}{% for m in messages %}<div class="alert">{{m}}</div>{% endfor %}{% endwith %}
+<form method="post"><label>Shared Staff Username</label><input name="username" minlength="4" maxlength="40" required>
+<label>Shared Staff Password (minimum 12 characters)</label><input type="password" name="password" minlength="12" required>
+<label>Confirm Password</label><input type="password" name="confirm" minlength="12" required>
+<button type="submit">Save / Update Shared Staff Login</button></form>
+<h3>Current Accounts</h3><p><small>{% for u in users %}{{u.username}} — {{u.role}}<br>{% endfor %}</small></p>
+<h3>Recent Activity</h3><p><small>{% for a in logs %}{{a.created_at}} · {{a.username}} · {{a.action}}<br>{% endfor %}</small></p>
+<p><a href="/">Open Dashboard</a> · <a href="/logout">Logout</a></p></div></div></body></html>"""
+
+@app.before_request
+def enforce_login():
+    allowed = {"setup", "login", "static"}
+    if request.endpoint in allowed or request.endpoint is None:
+        return None
+    if not user_count():
+        return redirect(url_for("setup"))
+    if not session.get("user_id"):
+        return redirect(url_for("login", next=request.path))
+    return None
+
+@app.route("/setup", methods=["GET","POST"])
+def setup():
+    if user_count():
+        abort(404)
+    if request.method == "POST":
+        username=request.form.get("username","").strip()
+        password=request.form.get("password","")
+        confirm=request.form.get("confirm","")
+        if len(username)<4 or len(password)<12 or password!=confirm:
+            flash("Username कमीत कमी 4 characters आणि password 12 characters असावा. Password confirmation जुळली पाहिजे.")
+            return redirect(url_for("setup"))
+        with db() as conn:
+            cur=conn.execute("INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+                (username,generate_password_hash(password), "admin",datetime.utcnow().isoformat(timespec="seconds")))
+            uid=cur.lastrowid
+        session.clear();session["user_id"]=uid;session["username"]=username;session["role"]="admin";session.permanent=True
+        log_activity(username,"Created initial Admin account")
+        return redirect(url_for("admin"))
+    return render_template_string(SETUP_PAGE)
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if not user_count():
+        return redirect(url_for("setup"))
+    locked_until=session.get("locked_until",0)
+    if time.time()<locked_until:
+        flash("Too many failed attempts. Please wait 5 minutes before trying again.")
+        return render_template_string(LOGIN_PAGE), 429
+    if request.method=="POST":
+        username=request.form.get("username","").strip()
+        password=request.form.get("password","")
+        with db() as conn:
+            user=conn.execute("SELECT * FROM users WHERE username=?",(username,)).fetchone()
+        if user and check_password_hash(user["password_hash"],password):
+            session.clear();session["user_id"]=user["id"];session["username"]=user["username"];session["role"]=user["role"];session.permanent=True
+            log_activity(username,"Successful login")
+            target=request.args.get("next","/")
+            if not target.startswith("/") or target.startswith("//"): target="/"
+            return redirect(target)
+        fails=session.get("fails",0)+1
+        session["fails"]=fails
+        if fails>=5:
+            session["fails"]=0;session["locked_until"]=time.time()+300
+        flash("Username किंवा Password चुकीचा आहे.")
+    return render_template_string(LOGIN_PAGE)
+
+@app.route("/logout")
+def logout():
+    if session.get("username"):
+        log_activity(session["username"],"Logout")
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/admin", methods=["GET","POST"])
+@admin_required
+def admin():
+    if request.method=="POST":
+        username=request.form.get("username","").strip()
+        password=request.form.get("password","")
+        confirm=request.form.get("confirm","")
+        if len(username)<4 or len(password)<12 or password!=confirm:
+            flash("Username किमान 4 characters आणि password किमान 12 characters असावा. Confirmation तपासा.")
+            return redirect(url_for("admin"))
+        with db() as conn:
+            existing=conn.execute("SELECT id FROM users WHERE role='staff' LIMIT 1").fetchone()
+            if existing:
+                conn.execute("UPDATE users SET username=?,password_hash=?,created_at=? WHERE id=?",
+                    (username,generate_password_hash(password),datetime.utcnow().isoformat(timespec="seconds"),existing["id"]))
+                action="Updated shared Staff login"
+            else:
+                conn.execute("INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+                    (username,generate_password_hash(password),"staff",datetime.utcnow().isoformat(timespec="seconds")))
+                action="Created shared Staff login"
+        log_activity(session["username"],action)
+        flash("Shared Staff login saved successfully.")
+        return redirect(url_for("admin"))
+    with db() as conn:
+        users=conn.execute("SELECT username,role FROM users ORDER BY role").fetchall()
+        logs=conn.execute("SELECT username,action,created_at FROM activity_log ORDER BY id DESC LIMIT 20").fetchall()
+    return render_template_string(ADMIN_PAGE,users=users,logs=logs)
+
+
 @app.route("/", methods=["GET"])
 def home():
     return render_template_string(PAGE)
@@ -603,13 +869,22 @@ def generate():
         return redirect(url_for("home"))
     try:
         result, blocks, records, total = generate_docx(excel, template)
-        filename = "Megapolis_Member_Circulation_Defaulter_Report.docx"
-        return send_file(result, as_attachment=True, download_name=filename,
-                         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        docx_filename = "Megapolis_Member_Circulation_Defaulter_Report.docx"
+
+        # Package the generated Word report inside a ZIP archive for download.
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            result.seek(0)
+            archive.writestr(docx_filename, result.read())
+        zip_buffer.seek(0)
+
+        zip_filename = "Megapolis_Member_Circulation_Defaulter_Report.zip"
+        return send_file(zip_buffer, as_attachment=True, download_name=zip_filename,
+                         mimetype="application/zip")
     except Exception as e:
         flash("Report तयार करताना error: " + str(e))
         return redirect(url_for("home"))
 
 if __name__ == "__main__":
     print("\\nOpen your browser at: http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "5000")), debug=False)
