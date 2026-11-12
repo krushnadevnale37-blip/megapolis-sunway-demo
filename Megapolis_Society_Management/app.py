@@ -434,9 +434,9 @@ def repair_excel_styles(file_stream):
         repaired.seek(0)
         return repaired
     except zipfile.BadZipFile:
-        raise ValueError('ही फाइल वैध .xlsx/.xlsm Excel फाइल नाही किंवा ZIP structure खराब आहे. Excel मध्ये उघडून Save As करा.')
+        raise ValueError('This is not a valid .xlsx/.xlsm Excel file, or its ZIP structure is damaged. Open it in Excel and use Save As.')
     except ET.ParseError:
-        raise ValueError('Excel मधील Styles XML वाचता आले नाही. कृपया Excel मध्ये फाइल उघडून नवीन .xlsx म्हणून Save करा.')
+        raise ValueError('Excel formatting information could not be read. Open the file in Excel and save it as a new .xlsx file.')
 
 
 def read_rows(file_stream):
@@ -444,14 +444,14 @@ def read_rows(file_stream):
     try:
         wb = load_workbook(safe_stream, data_only=True)
     except Exception as exc:
-        raise ValueError('Excel फाइल वाचता आली नाही. फाइल password-protected, unsupported किंवा गंभीरपणे corrupt असू शकते. तपशील: ' + str(exc))
+        raise ValueError('Could not read the Excel file. It may be password-protected, unsupported, or severely corrupted. Details: ' + str(exc))
     ws = wb.active
     headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
     required = ["Block", "Unit #", "Overdue Days", "Pending Amount"]
     norm = {h.lower(): i for i, h in enumerate(headers)}
     missing = [h for h in required if h.lower() not in norm]
     if missing:
-        raise ValueError("Excel मध्ये आवश्यक columns सापडले नाहीत: " + ", ".join(missing))
+        raise ValueError("Required columns were not found in the Excel file: " + ", ".join(missing))
     ix = {h: norm[h.lower()] for h in required}
     grouped = {}
     for vals in ws.iter_rows(min_row=2, values_only=True):
@@ -465,7 +465,7 @@ def read_rows(file_stream):
         amount = money(vals[ix["Pending Amount"]])
         grouped.setdefault(block, []).append((unit, overdue if overdue is not None else "", amount))
     if not grouped:
-        raise ValueError("Excel मध्ये report साठी कोणताही data सापडला नाही.")
+        raise ValueError("No report data was found in the Excel file.")
     return dict(sorted(grouped.items(), key=lambda x: x[0]))
 
 def clear_document_body(doc):
@@ -632,17 +632,13 @@ ADMIN_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Admin Co
 
 @app.before_request
 def enforce_login():
-    allowed = {"setup", "login", "static"}
-    if request.endpoint in allowed or request.endpoint is None:
-        return None
-    if not user_count():
-        return redirect(url_for("setup"))
-    if not session.get("user_id"):
-        return redirect(url_for("login", next=request.path))
+    # Public demo mode: no Admin setup, login, or session gate.
     return None
+
 
 @app.route("/setup", methods=["GET","POST"])
 def setup():
+    abort(404)
     if user_count():
         abort(404)
     if request.method == "POST":
@@ -650,7 +646,7 @@ def setup():
         password=request.form.get("password","")
         confirm=request.form.get("confirm","")
         if len(username)<4 or len(password)<12 or password!=confirm:
-            flash("Username कमीत कमी 4 characters आणि password 12 characters असावा. Password confirmation जुळली पाहिजे.")
+            flash("Username must contain at least 4 characters and password must contain at least 12 characters. Password confirmation must match.")
             return redirect(url_for("setup"))
         with db() as conn:
             cur=conn.execute("INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
@@ -663,6 +659,7 @@ def setup():
 
 @app.route("/login", methods=["GET","POST"])
 def login():
+    abort(404)
     if not user_count():
         return redirect(url_for("setup"))
     locked_until=session.get("locked_until",0)
@@ -684,25 +681,26 @@ def login():
         session["fails"]=fails
         if fails>=5:
             session["fails"]=0;session["locked_until"]=time.time()+300
-        flash("Username किंवा Password चुकीचा आहे.")
+        flash("Incorrect username or password.")
     return render_template_string(LOGIN_PAGE)
 
 @app.route("/logout")
 def logout():
+    abort(404)
     if session.get("username"):
         log_activity(session["username"],"Logout")
     session.clear()
     return redirect(url_for("login"))
 
 @app.route("/admin", methods=["GET","POST"])
-@admin_required
 def admin():
+    abort(404)
     if request.method=="POST":
         username=request.form.get("username","").strip()
         password=request.form.get("password","")
         confirm=request.form.get("confirm","")
         if len(username)<4 or len(password)<12 or password!=confirm:
-            flash("Username किमान 4 characters आणि password किमान 12 characters असावा. Confirmation तपासा.")
+            flash("Username must contain at least 4 characters and password must contain at least 12 characters. Please check the confirmation.")
             return redirect(url_for("admin"))
         with db() as conn:
             existing=conn.execute("SELECT id FROM users WHERE role='staff' LIMIT 1").fetchone()
@@ -816,11 +814,11 @@ def society_help():
 def analyze():
     excel = request.files.get("excel")
     if not excel or not excel.filename:
-        flash("Analysis साठी Excel file निवडा.")
+        flash("Please select an Excel file for analysis.")
         return redirect(url_for("home"))
     ext = os.path.splitext(secure_filename(excel.filename))[1].lower()
     if ext not in ALLOWED_EXCEL:
-        flash("कृपया .xlsx किंवा .xlsm Excel file निवडा.")
+        flash("Please select an .xlsx or .xlsm Excel file.")
         return redirect(url_for("home"))
     try:
         grouped = read_rows(excel)
@@ -851,7 +849,7 @@ def analyze():
             total=fmt_money(total), avg=fmt_money(avg), buckets=buckets,
             by_block=by_block, top=top, chart_json=json.dumps(by_block))
     except Exception as e:
-        flash("Analysis करताना Error: " + str(e))
+        flash("Error while analyzing the Excel file: " + str(e))
         return redirect(url_for("home"))
 
 
@@ -860,12 +858,12 @@ def generate():
     excel = request.files.get("excel")
     template = request.files.get("template")
     if not excel or not template or not excel.filename or not template.filename:
-        flash("कृपया Excel आणि Word दोन्ही files निवडा.")
+        flash("Please select both the Excel file and the Word template.")
         return redirect(url_for("home"))
     ex_ext = os.path.splitext(secure_filename(excel.filename))[1].lower()
     wd_ext = os.path.splitext(secure_filename(template.filename))[1].lower()
     if ex_ext not in ALLOWED_EXCEL or wd_ext not in ALLOWED_WORD:
-        flash("Excel साठी .xlsx/.xlsm आणि Word साठी .docx file वापरा.")
+        flash("Use an .xlsx/.xlsm file for Excel and a .docx file for the Word template.")
         return redirect(url_for("home"))
     try:
         result, blocks, records, total = generate_docx(excel, template)
@@ -882,7 +880,7 @@ def generate():
         return send_file(zip_buffer, as_attachment=True, download_name=zip_filename,
                          mimetype="application/zip")
     except Exception as e:
-        flash("Report तयार करताना error: " + str(e))
+        flash("Error while generating the report: " + str(e))
         return redirect(url_for("home"))
 
 if __name__ == "__main__":
